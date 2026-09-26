@@ -98,6 +98,10 @@
   .empty{color:var(--muted); text-align:center; padding:30px 10px; font-size:0.88rem;}
   .meta{color:var(--muted); font-size:0.72rem; margin-top:6px;}
   .status-line{font-size:0.78rem; color:var(--muted); margin-top:-10px; margin-bottom:14px;}
+  .mode-banner{
+    font-size:0.78rem; padding:8px 12px; border-radius:8px; margin-bottom:10px;
+    background:var(--tag-bg); color:var(--text); border:1px solid var(--border);
+  }
 
   .view-tabs{display:flex; gap:8px; margin-bottom:10px;}
 
@@ -375,6 +379,7 @@
     </div>
   </div>
 
+  <div class="mode-banner" id="mode-banner" style="display:none;"></div>
   <div class="status-line" id="status-line">Memuat data...</div>
 
   <div id="list"></div>
@@ -3129,22 +3134,81 @@ function renderPendingThumbs(){
   });
 }
 
+// ---------- Mode mandiri (localStorage) untuk hosting di luar claude.ai, mis. GitHub Pages ----------
+// Saat window.claude tidak tersedia (dbNs/assetsNs/downloadsNs semua null), aplikasi tetap berfungsi
+// penuh dengan menyimpan semuanya di localStorage browser ini (tidak tersinkron antar perangkat/rekan).
+
+const LS_KEYS = { bugs:'lwb_bugs', tags:'lwb_tags', modules:'lwb_modules', priorities:'lwb_priorities', images:'lwb_images' };
+
+function lsGet(key, fallback){
+  try{ const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
+  catch(e){ return fallback; }
+}
+function lsSet(key, val){
+  try{ localStorage.setItem(key, JSON.stringify(val)); }
+  catch(e){ console.error('localStorage penuh atau tidak tersedia', e); }
+}
+function persistLocalAll(){
+  if(dbNs) return;
+  lsSet(LS_KEYS.bugs, items);
+  lsSet(LS_KEYS.tags, tags);
+  lsSet(LS_KEYS.modules, modules);
+  lsSet(LS_KEYS.priorities, priorities);
+}
+
+function fileToDataUrl(file){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = ()=>resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+// Upload gambar: pakai assets Claude kalau tersedia, kalau tidak simpan sebagai data URI di localStorage
+async function uploadImageAny(file){
+  const webpFile = await fileToWebp(file);
+  if(assetsNs){
+    const res = await assetsNs.upload(webpFile);
+    return {id: res.id, url: res.url};
+  }
+  const dataUrl = await fileToDataUrl(webpFile);
+  const id = 'local-img-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
+  const imgs = lsGet(LS_KEYS.images, {});
+  imgs[id] = dataUrl;
+  lsSet(LS_KEYS.images, imgs);
+  return {id, url: dataUrl};
+}
+
+function browserDownload(filename, blobOrData){
+  const blob = (blobOrData instanceof Blob) ? blobOrData : new Blob([blobOrData]);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 1500);
+}
+
 $('f-image').addEventListener('change', async (e)=>{
   const files = Array.from(e.target.files || []);
   e.target.value = '';
   if(!files.length) return;
-  if(!assetsNs){ alert('Upload gambar tidak tersedia saat ini.'); return; }
   for(const file of files){
     try{
-      const webpFile = await fileToWebp(file);
-      const res = await assetsNs.upload(webpFile);
+      const res = await uploadImageAny(file);
       pendingImages.push({id: res.id, url: res.url});
-    }catch(err){ console.error(err); alert('Gagal mengunggah salah satu gambar.'); }
+    }catch(err){ console.error(err); showToast('Gagal mengunggah salah satu gambar.'); }
   }
   renderPendingThumbs();
 });
 
-function imgUrl(id){ return '/_blob/' + id; }
+function imgUrl(id){
+  if(typeof id === 'string' && id.startsWith('local-img-')){
+    const imgs = lsGet(LS_KEYS.images, {});
+    return imgs[id] || '';
+  }
+  return '/_blob/' + id;
+}
 
 // Konversi gambar ke format WebP sebelum diunggah
 function fileToWebp(file, quality=0.85){
@@ -3267,13 +3331,11 @@ $('ed-image').addEventListener('change', async (e)=>{
   const files = Array.from(e.target.files || []);
   e.target.value = '';
   if(!files.length) return;
-  if(!assetsNs){ alert('Upload gambar tidak tersedia saat ini.'); return; }
   for(const file of files){
     try{
-      const webpFile = await fileToWebp(file);
-      const res = await assetsNs.upload(webpFile);
+      const res = await uploadImageAny(file);
       edPendingImages.push({id: res.id, url: res.url});
-    }catch(err){ console.error(err); alert('Gagal mengunggah salah satu gambar.'); }
+    }catch(err){ console.error(err); showToast('Gagal mengunggah salah satu gambar.'); }
   }
   renderEdPendingThumbs();
 });
@@ -3399,6 +3461,12 @@ async function deleteItem(id){
     if(dbNs){
       await dbNs.doc('bugs/'+id).delete();
     } else {
+      const it = items.find(i=>i.id===id);
+      if(it && it.images && it.images.length){
+        const imgs = lsGet(LS_KEYS.images, {});
+        it.images.forEach(iid=>{ delete imgs[iid]; });
+        lsSet(LS_KEYS.images, imgs);
+      }
       items = items.filter(i=>i.id!==id);
       render();
     }
@@ -3556,6 +3624,7 @@ function getFilteredSortedItems(){
 }
 
 function render(){
+  persistLocalAll();
   const filtered = getFilteredSortedItems();
   $('status-line').textContent = items.length
     ? `${filtered.length} dari ${items.length} masalah ditampilkan`
@@ -3975,22 +4044,20 @@ function buildExportRows(){
 
 async function exportCsv(){
   if(typeof XLSX === 'undefined'){ showToast('Modul ekspor belum siap, coba lagi sesaat.'); return; }
-  const dl = await getDownloadsNs();
-  if(!dl){ showToast('Fitur unduh tidak tersedia di tampilan ini.'); return; }
   const rows = buildExportRows();
   if(!rows.length){ showToast('Tidak ada data untuk diekspor.'); return; }
   try{
     const ws = XLSX.utils.json_to_sheet(rows);
     const csv = XLSX.utils.sheet_to_csv(ws);
-    await dl.save({filename:'lwb-bug-tracker.csv', data: csv});
+    const dl = await getDownloadsNs();
+    if(dl){ await dl.save({filename:'lwb-bug-tracker.csv', data: csv}); }
+    else { browserDownload('lwb-bug-tracker.csv', new Blob(['\ufeff'+csv], {type:'text/csv;charset=utf-8;'})); }
     showToast('CSV berhasil diunduh.');
   }catch(err){ console.error(err); showToast('Gagal mengunduh CSV.'); }
 }
 
 async function exportXlsx(){
   if(typeof XLSX === 'undefined'){ showToast('Modul ekspor belum siap, coba lagi sesaat.'); return; }
-  const dl = await getDownloadsNs();
-  if(!dl){ showToast('Fitur unduh tidak tersedia di tampilan ini.'); return; }
   const rows = buildExportRows();
   if(!rows.length){ showToast('Tidak ada data untuk diekspor.'); return; }
   try{
@@ -3999,15 +4066,15 @@ async function exportXlsx(){
     XLSX.utils.book_append_sheet(wb, ws, 'Bug Tracker');
     const wbout = XLSX.write(wb, {bookType:'xlsx', type:'array'});
     const blob = new Blob([wbout], {type:'application/octet-stream'});
-    await dl.save({filename:'lwb-bug-tracker.xlsx', data: blob});
+    const dl = await getDownloadsNs();
+    if(dl){ await dl.save({filename:'lwb-bug-tracker.xlsx', data: blob}); }
+    else { browserDownload('lwb-bug-tracker.xlsx', blob); }
     showToast('Excel berhasil diunduh.');
   }catch(err){ console.error(err); showToast('Gagal mengunduh Excel.'); }
 }
 
 async function exportPdf(){
   if(typeof window.jspdf === 'undefined'){ showToast('Modul PDF belum siap, coba lagi sesaat.'); return; }
-  const dl = await getDownloadsNs();
-  if(!dl){ showToast('Fitur unduh tidak tersedia di tampilan ini.'); return; }
   const rows = buildExportRows();
   if(!rows.length){ showToast('Tidak ada data untuk diekspor.'); return; }
   try{
@@ -4028,7 +4095,9 @@ async function exportPdf(){
       margin:{left:40, right:40}
     });
     const blob = doc.output('blob');
-    await dl.save({filename:'lwb-bug-tracker.pdf', data: blob});
+    const dl = await getDownloadsNs();
+    if(dl){ await dl.save({filename:'lwb-bug-tracker.pdf', data: blob}); }
+    else { browserDownload('lwb-bug-tracker.pdf', blob); }
     showToast('PDF berhasil diunduh.');
   }catch(err){ console.error(err); showToast('Gagal membuat PDF.'); }
 }
@@ -4194,12 +4263,15 @@ async function init(){
       render();
     }
   } else {
-    tags = DEFAULT_TAGS.map((name,i)=>({id:'local-tag-'+i, name, color: TAG_PALETTE[i % TAG_PALETTE.length]}));
-    modules = DEFAULT_MODULES.map((name,i)=>({id:'local-module-'+i, name}));
-    priorities = DEFAULT_PRIORITIES.map((p,i)=>({id:'local-priority-'+i, name:p.name, color:p.color, order:i}));
+    items = lsGet(LS_KEYS.bugs, []);
+    tags = lsGet(LS_KEYS.tags, null) || DEFAULT_TAGS.map((name,i)=>({id:'local-tag-'+i, name, color: TAG_PALETTE[i % TAG_PALETTE.length]}));
+    modules = lsGet(LS_KEYS.modules, null) || DEFAULT_MODULES.map((name,i)=>({id:'local-module-'+i, name}));
+    priorities = lsGet(LS_KEYS.priorities, null) || DEFAULT_PRIORITIES.map((p,i)=>({id:'local-priority-'+i, name:p.name, color:p.color, order:i}));
     renderTagChoices(); renderEdTagChoices(); renderTagFilterOptions();
     renderModuleOptions(); renderPriorityOptions(); renderAllManagers();
-    $('status-line').textContent = 'Mode lokal (tidak tersinkron) — data hanya tersimpan selama halaman ini terbuka.';
+    const banner = $('mode-banner');
+    banner.style.display = 'block';
+    banner.textContent = '🔒 Mode mandiri: data (termasuk gambar) tersimpan di browser ini saja, tidak tersinkron ke perangkat/rekan lain.';
     render();
   }
 }
